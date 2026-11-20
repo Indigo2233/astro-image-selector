@@ -15,12 +15,14 @@ AstroImageSelector 是使用 Rust 和 eframe/egui 开发的 Windows 桌面应用
 从项目根目录运行以下命令。
 
 ```powershell
-cargo build --workspace --release --locked --target x86_64-pc-windows-msvc
+$env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
+$env:RUSTFLAGS = "-C target-feature=+crt-static"
+cargo build --workspace --release --locked --target x86_64-pc-windows-gnu
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-发行版构建使用静态 MSVC 运行库，构建时设置 `RUSTFLAGS="-C target-feature=+crt-static"`。第三方算法声明见 [Photutils 和 SciPy 许可证](licenses/PHOTUTILS-AND-SCIPY.txt)。
+发行版使用 MinGW-w64 UCRT 工具链。最终 EXE 只依赖 Windows 系统组件。第三方算法声明见 [Photutils 和 SciPy 许可证](licenses/PHOTUTILS-AND-SCIPY.txt)。
 
 版本标签会触发 GitHub Actions 构建 Windows x64 portable EXE，并将可执行文件附加到 Release。仓库源码不保存发行二进制。
 
