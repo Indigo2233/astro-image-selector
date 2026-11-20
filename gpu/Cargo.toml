@@ -1,0 +1,11 @@
+[package]
+name = "astro-gpu"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+astro-measurements = { path = "../measurements" }
+bytemuck = "1"
+pollster = "1"
+wgpu = { version = "30", default-features = false, features = ["std", "dx12", "vulkan", "wgsl"] }

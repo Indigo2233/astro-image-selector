@@ -1,0 +1,30 @@
+[package]
+name = "astro-selector"
+version = "1.1.0"
+edition = "2024"
+publish = false
+description = "Native Rust desktop application for FITS image quality analysis and selection"
+repository = "https://github.com/Indigo2233/astro-image-selector"
+license = "MIT"
+
+[[bin]]
+name = "astro-selector"
+path = "src/main.rs"
+
+[dependencies]
+astro-frames = { path = "../frames" }
+astro-gpu = { path = "../gpu" }
+astro-measurements = { path = "../measurements" }
+astro-stars = { path = "../stars" }
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow"] }
+egui_extras = { version = "0.37", default-features = false }
+egui_plot = "0.38"
+rayon = "1.10"
+rfd = { version = "0.18", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+astro-files = { path = "../files" }
+
+[dev-dependencies]
+tempfile = "3"

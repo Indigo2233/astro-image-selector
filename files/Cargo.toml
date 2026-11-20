@@ -1,0 +1,12 @@
+[package]
+name = "astro-files"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "FITS discovery and atomic project file management"
+
+[dependencies]
+tempfile = "3"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

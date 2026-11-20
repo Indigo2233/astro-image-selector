@@ -1,0 +1,18 @@
+[package]
+name = "astro-frames"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "FITS frame loading and grayscale preview for Astro Image Selector"
+
+[dependencies]
+bzip2 = "0.6"
+fitsrs = "0.4.1"
+flate2 = "1.1"
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz"] }
+zip = { version = "9.8", default-features = false, features = ["bzip2", "deflate-flate2", "lzma"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+tempfile = "3"
