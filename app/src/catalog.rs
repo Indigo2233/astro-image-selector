@@ -1,10 +1,40 @@
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub enum AnalysisStatus {
+    #[default]
+    Success,
+    ReadFailed,
+    InvalidFilter,
+    InvalidPixels,
+    NoStars,
+}
+
+impl AnalysisStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Success => "成功",
+            Self::ReadFailed => "读取失败",
+            Self::InvalidFilter => "滤镜头无效",
+            Self::InvalidPixels => "像素无效",
+            Self::NoStars => "未检出星点",
+        }
+    }
+
+    pub fn is_success(self) -> bool {
+        self == Self::Success
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AnalysisResult {
     pub filename: PathBuf,
+    #[serde(default)]
+    pub status: AnalysisStatus,
+    #[serde(default)]
+    pub error: Option<String>,
     pub filter_type: String,
     pub eccentricity: f64,
     pub fwhm: f64,
@@ -14,9 +44,11 @@ pub struct AnalysisResult {
 }
 
 impl AnalysisResult {
-    pub fn unreadable(file: &Path) -> Self {
+    pub fn failed(file: &Path, status: AnalysisStatus, error: impl Into<String>) -> Self {
         Self {
             filename: file.to_path_buf(),
+            status,
+            error: Some(error.into()),
             filter_type: "Unknown".into(),
             eccentricity: 1.0,
             fwhm: 0.0,
@@ -101,8 +133,12 @@ impl Metric {
         }
     }
 
+    pub fn status(self, image: &AnalysisResult) -> Option<f64> {
+        image.status.is_success().then(|| self.value(image))
+    }
+
     pub fn plot_value(self, image: &AnalysisResult) -> f64 {
-        let value = self.value(image);
+        let value = self.status(image).unwrap_or(f64::NAN);
         if value < 0.0 { 0.0 } else { value }
     }
 
@@ -111,7 +147,7 @@ impl Metric {
     }
 
     pub fn rejects(self, image: &AnalysisResult, limit: f64) -> bool {
-        let value = self.plot_value(image);
+        let value = self.status(image).unwrap_or(f64::NAN);
         value.is_finite()
             && if self.higher_is_better() {
                 value < limit
@@ -133,7 +169,7 @@ impl Metric {
     pub fn average_threshold(self, results: &[AnalysisResult]) -> Option<f64> {
         let (sum, count) = results
             .iter()
-            .map(|result| self.value(result))
+            .filter_map(|result| self.status(result))
             .filter(|&value| value.is_finite() && value > 0.0)
             .fold((0.0, 0), |(sum, count), value| (sum + value, count + 1));
         (count > 0).then(|| (sum / f64::from(count)).min(self.limits().1))
@@ -146,7 +182,9 @@ mod tests {
 
     #[test]
     fn threshold_comparisons_are_strict_and_ignore_nonfinite_values() {
-        let mut result = AnalysisResult::unreadable(Path::new("frame.fit"));
+        let mut result =
+            AnalysisResult::failed(Path::new("frame.fit"), AnalysisStatus::Success, "unused");
+        result.status = AnalysisStatus::Success;
         result.fwhm = 3.5;
         result.snr = 48.0;
 
@@ -169,8 +207,11 @@ mod tests {
 
     #[test]
     fn threshold_selection_is_scoped_to_the_selected_filter() {
-        let mut ha = AnalysisResult::unreadable(Path::new("a.fit"));
-        let mut oiii = AnalysisResult::unreadable(Path::new("b.fit"));
+        let mut ha = AnalysisResult::failed(Path::new("a.fit"), AnalysisStatus::Success, "unused");
+        let mut oiii =
+            AnalysisResult::failed(Path::new("b.fit"), AnalysisStatus::Success, "unused");
+        ha.status = AnalysisStatus::Success;
+        oiii.status = AnalysisStatus::Success;
         ha.filter_type = "Ha".into();
         ha.fwhm = 5.1;
         oiii.filter_type = "OIII".into();
@@ -184,5 +225,17 @@ mod tests {
             threshold_matches(&results, Metric::Fwhm, 5.0, None).count(),
             2
         );
+    }
+
+    #[test]
+    fn failed_results_never_enter_charts_thresholds_or_average_thresholds() {
+        let failed = AnalysisResult::failed(
+            Path::new("failed.fits"),
+            AnalysisStatus::ReadFailed,
+            "unreadable",
+        );
+        assert!(Metric::Fwhm.plot_value(&failed).is_nan());
+        assert!(!Metric::Fwhm.rejects(&failed, 0.0));
+        assert_eq!(Metric::Fwhm.average_threshold(&[failed]), None);
     }
 }

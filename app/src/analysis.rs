@@ -14,7 +14,7 @@ use astro_stars::port::{DetectionConfig, StarDetector};
 use rayon::prelude::*;
 
 use crate::cache::{AnalysisCache, save as save_cache};
-use crate::catalog::{AnalysisResult, normalize_filter};
+use crate::catalog::{AnalysisResult, AnalysisStatus, normalize_filter};
 
 pub struct Batch {
     pub results: Vec<AnalysisResult>,
@@ -25,6 +25,7 @@ pub struct Batch {
     pub cache_hits: usize,
     pub cache_path: Option<PathBuf>,
     pub cache_warning: Option<String>,
+    pub gpu_error: Option<String>,
 }
 
 static GPU: OnceLock<Result<Gpu, String>> = OnceLock::new();
@@ -52,6 +53,7 @@ impl AnalysisJob {
                     return Err("analysis manager stopped".into());
                 }
                 let result = analyze_files(
+                    &project,
                     &project,
                     &files,
                     workers,
@@ -116,18 +118,19 @@ fn looks_like_flat_name(path: &Path) -> bool {
 
 pub fn analyze_files(
     project: &Path,
+    source: &Path,
     files: &[PathBuf],
     workers: usize,
     use_gpu: bool,
     cancelled: &AtomicBool,
     progress: impl Fn(usize, usize) + Sync,
 ) -> Result<Batch, String> {
-    let mut cache = AnalysisCache::load(project);
+    let mut cache = AnalysisCache::load(project, if use_gpu { "gpu" } else { "cpu" });
     let mut cache_warning = cache.take_warning();
     let mut entries = Vec::with_capacity(files.len());
     let mut flat_files = Vec::new();
     for file in files {
-        let probe = cache.probe(project, file);
+        let probe = cache.probe(source, file);
         let fingerprint = probe.fingerprint;
         if probe.result.is_some() && !looks_like_flat_name(file) {
             entries.push((file.clone(), fingerprint, false, probe.result));
@@ -162,11 +165,7 @@ pub fn analyze_files(
     if missing.is_empty() {
         progress(cache_hits, light_count);
     }
-    let workers = if gpu.is_some() {
-        1
-    } else {
-        workers.max(1).min(missing.len().max(1))
-    };
+    let workers = effective_workers(workers, missing.len());
     let missing_files: Vec<_> = missing
         .iter()
         .map(|&index| entries[index].0.clone())
@@ -196,7 +195,7 @@ pub fn analyze_files(
                 Some((fingerprint, result))
             })
             .collect();
-        match save_cache(project, cache_entries) {
+        match save_cache(project, cache.engine(), cache_entries) {
             Ok(path) => Some(path),
             Err(error) => {
                 cache_warning = Some(format!("写入分析缓存失败: {error}"));
@@ -216,6 +215,7 @@ pub fn analyze_files(
         cache_hits,
         cache_path,
         cache_warning,
+        gpu_error: computed.gpu_error,
     })
 }
 
@@ -226,6 +226,31 @@ fn analyze_files_with_jobs(
     cancelled: &AtomicBool,
     progress: impl Fn(usize, usize) + Sync,
 ) -> Result<Batch, String> {
+    if files.is_empty() {
+        return Ok(Batch {
+            results: Vec::new(),
+            flat_count: 0,
+            flat_files: Vec::new(),
+            gpu: gpu.map(|device| device.name().to_owned()),
+            gpu_count: 0,
+            cache_hits: 0,
+            cache_path: None,
+            cache_warning: None,
+            gpu_error: None,
+        });
+    }
+    let mut shared_detector = StarDetector::new();
+    if let Some(baseline) = files.get(files.len() / 2)
+        && let Ok(frame) = load_for_analysis(baseline)
+    {
+        shared_detector.prepare_background(
+            &frame.pixels,
+            frame.width,
+            frame.height,
+            &DetectionConfig::default(),
+        );
+    }
+    let shared_detector = Arc::new(shared_detector);
     let detectors = Mutex::new(HashMap::<ThreadId, StarDetector>::new());
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(workers)
@@ -234,14 +259,22 @@ fn analyze_files_with_jobs(
         .map_err(|error| error.to_string())?;
     let completed = Mutex::new(0);
     let gpu_count = AtomicUsize::new(0);
+    let gpu_failures = Mutex::new(Vec::new());
     let slots = pool.install(|| {
         files
             .par_iter()
             .map(|file| {
-                let (result, gpu_used) =
-                    analyze_file(file, gpu, &detectors, || cancelled.load(Ordering::Relaxed))?;
+                let (result, gpu_used, gpu_error) =
+                    analyze_file(file, gpu, &detectors, &shared_detector, || {
+                        cancelled.load(Ordering::Relaxed)
+                    })?;
                 if gpu_used {
                     gpu_count.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(error) = gpu_error
+                    && let Ok(mut failures) = gpu_failures.lock()
+                {
+                    failures.push(error);
                 }
                 if !cancelled.load(Ordering::Relaxed)
                     && let Ok(mut count) = completed.lock()
@@ -262,44 +295,70 @@ fn analyze_files_with_jobs(
         cache_hits: 0,
         cache_path: None,
         cache_warning: None,
+        gpu_error: {
+            let failures = gpu_failures.into_inner().unwrap_or_default();
+            failures.into_iter().next()
+        },
     })
+}
+
+fn effective_workers(requested: usize, file_count: usize) -> usize {
+    requested.max(1).min(file_count.max(1))
 }
 
 fn analyze_file(
     file: &Path,
     gpu: Option<&Gpu>,
     detectors: &Mutex<HashMap<ThreadId, StarDetector>>,
+    shared_detector: &StarDetector,
     cancelled: impl Fn() -> bool + Sync,
-) -> Option<(AnalysisResult, bool)> {
+) -> Option<(AnalysisResult, bool, Option<String>)> {
     if cancelled() {
         return None;
     }
-    let Ok(frame) = load_for_analysis(file) else {
-        return Some((AnalysisResult::unreadable(file), false));
+    let frame = match load_for_analysis(file) {
+        Ok(frame) => frame,
+        Err(error) => {
+            return Some((
+                AnalysisResult::failed(file, AnalysisStatus::ReadFailed, error),
+                false,
+                None,
+            ));
+        }
     };
     if cancelled() {
         return None;
     }
-    let Ok(filter) = frame.metadata.analysis_filter() else {
-        return Some((AnalysisResult::unreadable(file), false));
+    let filter = match frame.metadata.analysis_filter() {
+        Ok(filter) => filter,
+        Err(error) => {
+            return Some((
+                AnalysisResult::failed(file, AnalysisStatus::InvalidFilter, error),
+                false,
+                None,
+            ));
+        }
     };
-    let stars = if frame.shape.len() == 2 {
-        detectors
-            .lock()
-            .ok()
-            .map(|mut detectors| {
-                let detector = detectors.entry(std::thread::current().id()).or_default();
-                detector.detect_cancellable(
-                    &frame.pixels,
-                    frame.width,
-                    frame.height,
-                    &DetectionConfig::default(),
-                    &cancelled,
-                )
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
+    let stars = match detectors.lock() {
+        Ok(mut detectors) => {
+            let detector = detectors
+                .entry(std::thread::current().id())
+                .or_insert_with(|| (*shared_detector).clone());
+            detector.detect_cancellable(
+                &frame.pixels,
+                frame.width,
+                frame.height,
+                &DetectionConfig::default(),
+                &cancelled,
+            )
+        }
+        Err(_) => {
+            return Some((
+                AnalysisResult::failed(file, AnalysisStatus::NoStars, "星点检测器状态不可用"),
+                false,
+                None,
+            ));
+        }
     };
     if cancelled() {
         return None;
@@ -314,23 +373,25 @@ fn analyze_file(
         })
         .collect();
     let config = MeasurementConfig::default();
+    let mut gpu_error = None;
     let from_gpu = gpu.and_then(|device| {
-        device
-            .measure_cancellable(
-                &frame.pixels,
-                frame.width,
-                frame.height,
-                &candidates,
-                &config,
-                &cancelled,
-            )
-            .ok()
-            .flatten()
+        match device.measure_cancellable(
+            &frame.pixels,
+            frame.width,
+            frame.height,
+            &candidates,
+            &config,
+            &cancelled,
+        ) {
+            Ok(measurement) => measurement,
+            Err(error) => {
+                gpu_error = Some(error);
+                None
+            }
+        }
     });
     let used_gpu = from_gpu.is_some();
-    let Measurement {
-        fwhm, eccentricity, ..
-    } = from_gpu.or_else(|| {
+    let measurement = from_gpu.or_else(|| {
         measure_cancellable(
             &frame.pixels,
             frame.width,
@@ -339,14 +400,38 @@ fn analyze_file(
             &config,
             &cancelled,
         )
-    })?;
+    });
+    let Measurement {
+        fwhm,
+        eccentricity,
+        used_stars,
+    } = measurement.unwrap_or_default();
+    let status = if stars.is_empty() || used_stars == 0 {
+        AnalysisStatus::NoStars
+    } else {
+        AnalysisStatus::Success
+    };
     let snr = snr(&frame.pixels);
     let mean_brightness = frame.pixels.iter().sum::<f64>() / frame.pixels.len() as f64;
+    if !snr.is_finite() || !mean_brightness.is_finite() {
+        return Some((
+            AnalysisResult::failed(
+                file,
+                AnalysisStatus::InvalidPixels,
+                "SNR 或平均亮度非有限值",
+            ),
+            used_gpu,
+            gpu_error,
+        ));
+    }
+    let error = (status == AnalysisStatus::NoStars).then(|| "未检出可测量的星点".to_owned());
 
     (!cancelled()).then(|| {
         (
             AnalysisResult {
                 filename: file.to_path_buf(),
+                status,
+                error,
                 filter_type: normalize_filter(filter),
                 eccentricity,
                 fwhm,
@@ -355,6 +440,7 @@ fn analyze_file(
                 mean_brightness,
             },
             used_gpu,
+            gpu_error,
         )
     })
 }
@@ -389,12 +475,50 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn synthetic_fits(project: &Path, name: &str) -> PathBuf {
+        let path = project.join(name);
+        let side = 160_u32;
+        let mut bytes = Vec::new();
+        for (keyword, value) in [
+            ("SIMPLE", "                    T"),
+            ("BITPIX", "                   16"),
+            ("NAXIS", "                    2"),
+            ("NAXIS1", &format!("{side:>20}")),
+            ("NAXIS2", &format!("{side:>20}")),
+            ("FILTER", "'Ha'"),
+        ] {
+            let card = format!("{keyword:<8}= {value}{}", " ".repeat(80));
+            bytes.extend_from_slice(&card.as_bytes()[..80]);
+        }
+        let end = format!("{:<80}", "END");
+        bytes.extend_from_slice(end.as_bytes());
+        while !bytes.len().is_multiple_of(2880) {
+            bytes.push(b' ');
+        }
+        for y in 0..side {
+            for x in 0..side {
+                let dx = x as f64 - 80.3;
+                let dy = y as f64 - 79.6;
+                let level = 1000.0
+                    + f64::from((x * 13 + y * 17) % 5)
+                    + 1800.0 * (-(dx * dx + dy * dy) / 3.645).exp();
+                bytes.extend_from_slice(&(level as i16).to_be_bytes());
+            }
+        }
+        while !bytes.len().is_multiple_of(2880) {
+            bytes.push(0);
+        }
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
     #[test]
     fn preserves_input_order_and_reports_progress_once_per_file() {
         let files = [PathBuf::from("absent_b.fit"), PathBuf::from("absent_a.fit")];
         let progress = Mutex::new(Vec::new());
         let root = tempfile::tempdir().unwrap();
         let batch = analyze_files(
+            root.path(),
             root.path(),
             &files,
             2,
@@ -419,10 +543,18 @@ mod tests {
         let files = vec![PathBuf::from("absent.fit"); 8];
         let cancelled = AtomicBool::new(false);
         let root = tempfile::tempdir().unwrap();
-        let batch = analyze_files(root.path(), &files, 1, false, &cancelled, |current, _| {
-            assert_eq!(current, 1);
-            cancelled.store(true, Ordering::Relaxed);
-        })
+        let batch = analyze_files(
+            root.path(),
+            root.path(),
+            &files,
+            1,
+            false,
+            &cancelled,
+            |current, _| {
+                assert_eq!(current, 1);
+                cancelled.store(true, Ordering::Relaxed);
+            },
+        )
         .unwrap();
         assert_eq!(batch.results.len(), 1);
     }
@@ -436,18 +568,46 @@ mod tests {
     }
 
     #[test]
+    fn gpu_requests_keep_cpu_worker_count() {
+        assert_eq!(effective_workers(6, 12), 6);
+        assert_eq!(effective_workers(6, 2), 2);
+        assert_eq!(effective_workers(0, 2), 1);
+    }
+
+    #[test]
+    fn empty_work_does_not_panic() {
+        let project = tempfile::tempdir().unwrap();
+        let batch = analyze_files(
+            project.path(),
+            project.path(),
+            &[],
+            4,
+            false,
+            &AtomicBool::new(false),
+            |_, _| {},
+        )
+        .unwrap();
+        assert!(batch.results.is_empty());
+    }
+
+    #[test]
     fn repeated_analysis_reuses_cache_and_changed_files_are_recomputed() {
         let project = tempfile::tempdir().unwrap();
         for name in ["b.fits", "a.fits"] {
-            fs::copy(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("../frames/tests/reference/星点.fits"),
-                project.path().join(name),
-            )
-            .unwrap();
+            synthetic_fits(project.path(), name);
         }
         let files = [project.path().join("b.fits"), project.path().join("a.fits")];
         let cancelled = AtomicBool::new(false);
-        let first = analyze_files(project.path(), &files, 2, false, &cancelled, |_, _| {}).unwrap();
+        let first = analyze_files(
+            project.path(),
+            project.path(),
+            &files,
+            2,
+            false,
+            &cancelled,
+            |_, _| {},
+        )
+        .unwrap();
         assert_eq!(first.cache_hits, 0);
         assert_eq!(
             first.cache_path,
@@ -462,12 +622,29 @@ mod tests {
             files.iter().collect::<Vec<_>>()
         );
 
-        let second =
-            analyze_files(project.path(), &files, 2, false, &cancelled, |_, _| {}).unwrap();
+        let second = analyze_files(
+            project.path(),
+            project.path(),
+            &files,
+            2,
+            false,
+            &cancelled,
+            |_, _| {},
+        )
+        .unwrap();
         assert_eq!(second.cache_hits, 2);
 
         fs::write(project.path().join("a.fits"), b"changed").unwrap();
-        let third = analyze_files(project.path(), &files, 2, false, &cancelled, |_, _| {}).unwrap();
+        let third = analyze_files(
+            project.path(),
+            project.path(),
+            &files,
+            2,
+            false,
+            &cancelled,
+            |_, _| {},
+        )
+        .unwrap();
         assert_eq!(third.cache_hits, 1);
     }
 
@@ -477,43 +654,61 @@ mod tests {
         let file = project.path().join("broken.fits");
         fs::write(&file, b"not a FITS file").unwrap();
         let cancelled = AtomicBool::new(false);
-        analyze_files(project.path(), &[file], 1, false, &cancelled, |_, _| {}).unwrap();
+        analyze_files(
+            project.path(),
+            project.path(),
+            &[file],
+            1,
+            false,
+            &cancelled,
+            |_, _| {},
+        )
+        .unwrap();
         let cache: serde_json::Value = serde_json::from_slice(
             &fs::read(project.path().join(crate::cache::CACHE_FILE_NAME)).unwrap(),
         )
         .unwrap();
-        assert_eq!(cache["entries"].as_array().unwrap().len(), 0);
+        assert_eq!(cache["engines"]["cpu"].as_array().unwrap().len(), 0);
     }
 
     #[test]
-    fn cache_without_new_work_does_not_report_gpu_fallback() {
+    fn cpu_cache_is_not_reused_for_gpu_measurements() {
         let project = tempfile::tempdir().unwrap();
-        let file = project.path().join("frame.fits");
-        fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../frames/tests/reference/星点.fits"),
-            &file,
-        )
-        .unwrap();
+        let file = synthetic_fits(project.path(), "frame.fits");
         let files = [file];
         let cancelled = AtomicBool::new(false);
-        analyze_files(project.path(), &files, 1, false, &cancelled, |_, _| {}).unwrap();
-        let result = analyze_files(project.path(), &files, 1, true, &cancelled, |_, _| {}).unwrap();
-        assert_eq!(result.cache_hits, 1);
-        assert_eq!(result.gpu_count, 0);
-        assert!(result.cache_hits > 0);
+        analyze_files(
+            project.path(),
+            project.path(),
+            &files,
+            1,
+            false,
+            &cancelled,
+            |_, _| {},
+        )
+        .unwrap();
+        let result = analyze_files(
+            project.path(),
+            project.path(),
+            &files,
+            1,
+            true,
+            &cancelled,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(result.cache_hits, 0);
+        assert!(result.gpu_count > 0);
+        assert_eq!(result.results.len(), 1);
     }
 
     #[test]
     fn valid_cache_skips_fits_heads_and_computation() {
         let project = tempfile::tempdir().unwrap();
-        let file = project.path().join("frame.fits");
-        fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../frames/tests/reference/星点.fits"),
-            &file,
-        )
-        .unwrap();
+        let file = synthetic_fits(project.path(), "frame.fits");
         let cancelled = AtomicBool::new(false);
         analyze_files(
+            project.path(),
             project.path(),
             std::slice::from_ref(&file),
             1,
@@ -528,7 +723,7 @@ mod tests {
         let cache_path = project.path().join(crate::cache::CACHE_FILE_NAME);
         let mut document: serde_json::Value =
             serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
-        let entries = document["entries"].as_array_mut().unwrap();
+        let entries = document["engines"]["cpu"].as_array_mut().unwrap();
         entries[0]["size"] = metadata.len().into();
         entries[0]["modified_ns"] = u64::try_from(
             metadata
@@ -542,8 +737,16 @@ mod tests {
         .into();
         fs::write(&cache_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
 
-        let batch =
-            analyze_files(project.path(), &[file], 1, false, &cancelled, |_, _| {}).unwrap();
+        let batch = analyze_files(
+            project.path(),
+            project.path(),
+            &[file],
+            1,
+            false,
+            &cancelled,
+            |_, _| {},
+        )
+        .unwrap();
         assert_eq!(batch.cache_hits, 1);
         assert_eq!(batch.results.len(), 1);
     }
@@ -551,13 +754,12 @@ mod tests {
     #[test]
     fn flat_frames_are_removed_before_analysis() {
         let project = tempfile::tempdir().unwrap();
-        let source =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../frames/tests/reference/星点.fits");
         let light = project.path().join("light.fits");
         let flat = project.path().join("flat_001.fits");
-        fs::copy(source, &light).unwrap();
+        synthetic_fits(project.path(), "light.fits");
         fs::copy(&light, &flat).unwrap();
         let batch = analyze_files(
+            project.path(),
             project.path(),
             &[light.clone(), flat.clone()],
             1,
@@ -581,24 +783,31 @@ mod tests {
     #[test]
     fn cache_records_remain_bound_to_original_light_files_after_a_flat() {
         let project = tempfile::tempdir().unwrap();
-        let source =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../frames/tests/reference/星点.fits");
         let flat = project.path().join("flat.fits");
         let first = project.path().join("first.fits");
         let second = project.path().join("second.fits");
-        for path in [&flat, &first, &second] {
-            fs::copy(&source, path).unwrap();
-        }
+        synthetic_fits(project.path(), "first.fits");
+        fs::copy(&first, &flat).unwrap();
+        fs::copy(&first, &second).unwrap();
         let files = [flat, first.clone(), second.clone()];
         let cancelled = AtomicBool::new(false);
-        let batch = analyze_files(project.path(), &files, 1, false, &cancelled, |_, _| {}).unwrap();
+        let batch = analyze_files(
+            project.path(),
+            project.path(),
+            &files,
+            1,
+            false,
+            &cancelled,
+            |_, _| {},
+        )
+        .unwrap();
         assert_eq!(batch.flat_count, 1);
 
         let cache: serde_json::Value = serde_json::from_slice(
             &fs::read(project.path().join(crate::cache::CACHE_FILE_NAME)).unwrap(),
         )
         .unwrap();
-        let paths: Vec<_> = cache["entries"]
+        let paths: Vec<_> = cache["engines"]["cpu"]
             .as_array()
             .unwrap()
             .iter()
@@ -607,6 +816,7 @@ mod tests {
         assert_eq!(paths, ["first.fits", "second.fits"]);
 
         let repeated = analyze_files(
+            project.path(),
             project.path(),
             &[first, second],
             1,

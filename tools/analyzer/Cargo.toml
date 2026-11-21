@@ -1,0 +1,12 @@
+[package]
+name = "analyzer-benchmark"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Validation utility for AstroImageSelector analysis"
+license = "MIT"
+
+[dependencies]
+astro-files = { path = "../../files" }
+astro-selector = { path = "../../app" }
+serde_json = "1"

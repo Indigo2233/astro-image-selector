@@ -1,8 +1,5 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-mod analysis;
-mod cache;
-mod catalog;
 mod chart;
 mod desktop;
 mod preview;

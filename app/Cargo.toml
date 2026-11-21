@@ -7,6 +7,10 @@ description = "Native Rust desktop application for FITS image quality analysis a
 repository = "https://github.com/Indigo2233/astro-image-selector"
 license = "MIT"
 
+[lib]
+name = "astro_selector"
+path = "src/lib.rs"
+
 [[bin]]
 name = "astro-selector"
 path = "src/main.rs"

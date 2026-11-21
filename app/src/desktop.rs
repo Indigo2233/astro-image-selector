@@ -16,10 +16,12 @@ use eframe::egui::{
 };
 use egui_extras::{Column, TableBuilder};
 
-use crate::analysis::{AnalysisJob, Batch, auto_device, available_workers, default_workers};
-use crate::catalog::{AnalysisResult, Metric, threshold_matches};
 use crate::chart::{Chart, ChartState, filter_color};
 use crate::preview::{self, Preview, PreviewRequest, PreviewResult};
+use astro_selector::analysis::{
+    AnalysisJob, Batch, auto_device, available_workers, default_workers,
+};
+use astro_selector::catalog::{AnalysisResult, Metric, threshold_matches};
 
 const WINDOW_BACKGROUND: Color32 = Color32::from_gray(45);
 const PANEL_BACKGROUND: Color32 = Color32::from_gray(58);
@@ -75,7 +77,8 @@ enum Event {
     Scanned(u64, Option<Vec<PathBuf>>),
     AnalysisProgress(u64, usize, usize),
     Analyzed(u64, Result<Batch, String>),
-    Moved(u64, Vec<PathBuf>, usize),
+    Moved(u64, Vec<PathBuf>, Vec<(PathBuf, String)>),
+    Restored(u64, Vec<PathBuf>, Vec<(PathBuf, String)>),
     Preview(PreviewResult),
 }
 
@@ -91,6 +94,8 @@ struct Desktop {
     cancel_scan: Option<Arc<AtomicBool>>,
     scanning: bool,
     moving_files: bool,
+    rejected_files: Vec<PathBuf>,
+    operation_errors: Vec<String>,
     progress: (usize, usize),
     workers: usize,
     use_gpu: bool,
@@ -159,6 +164,8 @@ impl Desktop {
             cancel_scan: None,
             scanning: false,
             moving_files: false,
+            rejected_files: Vec::new(),
+            operation_errors: Vec::new(),
             workers: default_workers(),
             use_gpu,
             device_hint,
@@ -229,6 +236,8 @@ impl Desktop {
         self.scanning = true;
         self.status = "正在扫描 FITS 文件…".into();
         self.project = Some(directory.clone());
+        let manager = FileManager::new(&directory);
+        self.rejected_files = manager.rejected_files();
         let cancelled = Arc::new(AtomicBool::new(false));
         self.cancel_scan = Some(cancelled.clone());
         let id = self.task_id;
@@ -308,18 +317,51 @@ impl Desktop {
         self.task_id += 1;
         let id = self.task_id;
         let requested: Vec<_> = self.rejected.iter().cloned().collect();
-        let count = requested.len();
         self.status = "正在移动标记文件…".into();
         self.moving_files = true;
+        self.operation_errors.clear();
         let ctx = self.ctx.clone();
         let send = self.send.clone();
         std::thread::spawn(move || {
             let manager = FileManager::new(project);
-            let moved = requested
-                .into_iter()
-                .filter(|filename| manager.reject(filename).is_ok())
-                .collect();
-            signal(&ctx, &send, Event::Moved(id, moved, count));
+            let mut moved = Vec::new();
+            let mut failures = Vec::new();
+            for filename in requested {
+                match manager.reject(&filename) {
+                    Ok(_) => moved.push(filename),
+                    Err(error) => failures.push((filename, error.to_string())),
+                }
+            }
+            signal(&ctx, &send, Event::Moved(id, moved, failures));
+        });
+    }
+
+    fn restore_rejected(&mut self) {
+        if self.rejected_files.is_empty() || self.moving_files || self.analysis_cancel.is_some() {
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        self.task_id += 1;
+        let id = self.task_id;
+        let requested = self.rejected_files.clone();
+        self.status = "正在恢复已排除文件…".into();
+        self.moving_files = true;
+        self.operation_errors.clear();
+        let ctx = self.ctx.clone();
+        let send = self.send.clone();
+        std::thread::spawn(move || {
+            let manager = FileManager::new(project);
+            let mut restored = Vec::new();
+            let mut failures = Vec::new();
+            for filename in requested {
+                match manager.restore(&filename) {
+                    Ok(_) => restored.push(filename),
+                    Err(error) => failures.push((filename, error.to_string())),
+                }
+            }
+            signal(&ctx, &send, Event::Restored(id, restored, failures));
         });
     }
 
@@ -535,7 +577,9 @@ impl Desktop {
                             cache_hits,
                             cache_path,
                             cache_warning,
+                            gpu_error,
                         }) => {
+                            let project_root = self.project.clone();
                             self.files = results
                                 .iter()
                                 .map(|result| result.filename.clone())
@@ -562,8 +606,15 @@ impl Desktop {
                             if let Some(warning) = cache_warning {
                                 status.push_str(&format!(" · {warning}"));
                             }
+                            if let Some(error) = gpu_error {
+                                status.push_str(&format!(" · GPU 回退: {error}"));
+                            }
                             self.status = status;
                             self.results = results;
+                            if let Some(project_root) = project_root {
+                                self.rejected_files =
+                                    FileManager::new(project_root).rejected_files();
+                            }
                             self.rebuild_indexes();
                             self.set_average_threshold();
                             self.recenter_chart = true;
@@ -571,7 +622,7 @@ impl Desktop {
                         Err(error) => self.status = format!("分析失败：{error}"),
                     }
                 }
-                Event::Moved(id, moved, requested) if id == self.task_id => {
+                Event::Moved(id, moved, failures) if id == self.task_id => {
                     self.moving_files = false;
                     let moved: BTreeSet<_> = moved.into_iter().collect();
                     self.files.retain(|file| !moved.contains(file));
@@ -586,19 +637,73 @@ impl Desktop {
                         self.clear_preview();
                     }
                     self.rebuild_indexes();
-                    let failures = requested - moved.len();
-                    self.status = if failures == 0 {
+                    self.rejected_files =
+                        FileManager::new(self.project.as_deref().unwrap_or(Path::new(".")))
+                            .rejected_files();
+                    self.operation_errors = failures
+                        .iter()
+                        .map(|(file, error)| format!("{}: {error}", file.display()))
+                        .collect();
+                    self.status = if failures.is_empty() {
                         format!("已移动 {} 个文件到 rejected", moved.len())
                     } else {
-                        format!("已移动 {} 个文件，{failures} 个移动失败", moved.len())
+                        format!(
+                            "已移动 {} 个文件，{} 个移动失败",
+                            moved.len(),
+                            failures.len()
+                        )
                     };
+                }
+                Event::Restored(id, restored, failures) if id == self.task_id => {
+                    self.moving_files = false;
+                    let restored: BTreeSet<_> = restored.into_iter().collect();
+                    self.rejected_files =
+                        FileManager::new(self.project.as_deref().unwrap_or(Path::new(".")))
+                            .rejected_files();
+                    self.operation_errors = failures
+                        .iter()
+                        .map(|(file, error)| format!("{}: {error}", file.display()))
+                        .collect();
+                    self.status = if restored.is_empty() {
+                        format!("{} 个文件恢复失败", failures.len())
+                    } else if failures.is_empty() {
+                        format!("已恢复 {} 个文件", restored.len())
+                    } else {
+                        format!(
+                            "已恢复 {} 个文件，{} 个恢复失败",
+                            restored.len(),
+                            failures.len()
+                        )
+                    };
+                    if !restored.is_empty() {
+                        self.scanning = true;
+                        let Some(directory) = self.project.clone() else {
+                            return;
+                        };
+                        let cancelled = Arc::new(AtomicBool::new(false));
+                        self.cancel_scan = Some(cancelled.clone());
+                        let scan_id = self.task_id;
+                        let ctx = self.ctx.clone();
+                        let send = self.send.clone();
+                        std::thread::spawn(move || {
+                            let files = scan_cancellable(&directory, &cancelled);
+                            signal(
+                                &ctx,
+                                &send,
+                                Event::Scanned(
+                                    scan_id,
+                                    (!cancelled.load(Ordering::Relaxed)).then_some(files),
+                                ),
+                            );
+                        });
+                    }
                 }
                 Event::Preview((id, preview)) if id == self.preview_id => {
                     self.apply_preview(preview)
                 }
                 Event::Scanned(_, _) | Event::AnalysisProgress(_, _, _) | Event::Analyzed(_, _) => {
                 }
-                Event::Moved(_, _, _) | Event::Preview(_) => {}
+                Event::Moved(_, _, _) | Event::Restored(_, _, _) | Event::Preview(_) => {}
             }
         }
     }
@@ -765,6 +870,26 @@ impl Desktop {
             }
             ui.colored_label(MUTED, "移动到项目的 rejected 文件夹");
             ui.colored_label(MUTED, format!("选中: {} 个文件", self.rejected.len()));
+            let restore_enabled = !self.rejected_files.is_empty() && !running && !self.moving_files;
+            if action(
+                ui,
+                &format!("恢复 rejected 文件（{}）", self.rejected_files.len()),
+                restore_enabled,
+                ui.available_width(),
+            ) {
+                self.restore_rejected();
+            }
+            if !self.operation_errors.is_empty() {
+                ui.collapsing(
+                    format!("操作失败（{}）", self.operation_errors.len()),
+                    |ui| {
+                        for error in self.operation_errors.iter().take(8) {
+                            ui.add(Label::new(RichText::new(error).small()).truncate())
+                                .on_hover_text(error);
+                        }
+                    },
+                );
+            }
             let can_select = !self.results.is_empty() && !self.moving_files;
             if action(ui, "全选不合格", can_select, ui.available_width()) {
                 self.select_by_threshold();
@@ -926,10 +1051,17 @@ impl Desktop {
                         .map(|&index| &self.results[index]);
                     row.col(|ui| {
                         if let Some(result) = result {
-                            ui.colored_label(
-                                filter_color(&result.filter_type),
-                                &result.filter_type,
-                            );
+                            if result.status.is_success() {
+                                ui.colored_label(
+                                    filter_color(&result.filter_type),
+                                    &result.filter_type,
+                                );
+                            } else {
+                                ui.colored_label(Color32::from_rgb(244, 98, 88), "失败")
+                                    .on_hover_text(
+                                        result.error.as_deref().unwrap_or(result.status.label()),
+                                    );
+                            }
                         } else {
                             ui.label("—");
                         }
@@ -944,7 +1076,9 @@ impl Desktop {
                             let label = result.map_or_else(
                                 || "—".into(),
                                 |image| {
-                                    if metric == Metric::Stars {
+                                    if !image.status.is_success() {
+                                        "—".into()
+                                    } else if metric == Metric::Stars {
                                         image.star_count.to_string()
                                     } else {
                                         format!("{:.2}", metric.value(image))

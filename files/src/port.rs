@@ -358,4 +358,42 @@ mod scan_tests {
             ]
         );
     }
+
+    #[test]
+    fn restore_reports_destination_conflicts() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("frame.fits"), b"rejected").unwrap();
+        let manager = FileManager::new(root.path());
+        manager.reject(Path::new("frame.fits")).unwrap();
+        fs::write(root.path().join("frame.fits"), b"current").unwrap();
+
+        let error = manager.restore(Path::new("frame.fits")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(root.path().join("rejected/frame.fits")).unwrap(),
+            b"rejected"
+        );
+        assert_eq!(
+            fs::read(root.path().join("frame.fits")).unwrap(),
+            b"current"
+        );
+    }
+
+    #[test]
+    fn restore_and_reject_round_trip_preserves_nested_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("session");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("frame.fits"), b"pixels").unwrap();
+        let manager = FileManager::new(root.path());
+
+        manager.reject(Path::new("session/frame.fits")).unwrap();
+        assert_eq!(
+            manager.rejected_files(),
+            [PathBuf::from("session/frame.fits")]
+        );
+        let restored = manager.restore(Path::new("session/frame.fits")).unwrap();
+        assert_eq!(fs::read(restored).unwrap(), b"pixels");
+        assert_eq!(fs::read(nested.join("frame.fits")).unwrap(), b"pixels");
+    }
 }

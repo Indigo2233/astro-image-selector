@@ -2,6 +2,7 @@
 //! See `licenses/PHOTUTILS-AND-SCIPY.txt` for the algorithm notices.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::LazyLock;
 
 const KERNEL_RADIUS: usize = 2;
@@ -37,13 +38,91 @@ impl Default for DetectionConfig {
 
 #[derive(Default)]
 pub struct StarDetector {
-    backgrounds: HashMap<(usize, usize, u64), BackgroundStats>,
+    backgrounds: HashMap<(usize, usize, u64), Arc<BackgroundStats>>,
 }
 
 #[derive(Clone, Copy)]
-struct BackgroundStats {
+pub struct BackgroundStats {
     threshold: f64,
     level: f64,
+    signature: BackgroundSignature,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BackgroundSignature {
+    median: f64,
+    noise: f64,
+    gradient: f64,
+}
+
+impl BackgroundSignature {
+    fn sample(crop: &Crop) -> Self {
+        let sample_side = (crop.width.min(crop.height).div_ceil(8)).clamp(8, 48);
+        let stride = (crop.width.min(crop.height) / sample_side).max(1);
+        let right = crop.width.saturating_sub(stride).max(stride + 1);
+        let bottom = crop.height.saturating_sub(stride).max(stride + 1);
+        let mut values = Vec::with_capacity(sample_side * sample_side);
+        let mut quadrants = [0.0; 4];
+        let mut counts = [0_usize; 4];
+        for y in (stride..bottom).step_by(stride) {
+            for x in (stride..right).step_by(stride) {
+                let value = crop.pixels[y * crop.width + x];
+                if value.is_finite() {
+                    values.push(value);
+                    let quadrant =
+                        usize::from(x >= crop.width / 2) + 2 * usize::from(y >= crop.height / 2);
+                    quadrants[quadrant] += value;
+                    counts[quadrant] += 1;
+                }
+            }
+        }
+        if values.len() < 12 {
+            return Self::default();
+        }
+        values.sort_unstable_by(f64::total_cmp);
+        let median = values[values.len() / 2];
+        let mut deviations: Vec<_> = values.iter().map(|value| (value - median).abs()).collect();
+        deviations.sort_unstable_by(f64::total_cmp);
+        let noise = 1.4826 * deviations[deviations.len() / 2];
+        let quadrant_means: Vec<_> = quadrants
+            .into_iter()
+            .zip(counts)
+            .filter(|(_, count)| *count > 0)
+            .map(|(sum, count)| sum / count as f64)
+            .collect();
+        let mean = quadrant_means.iter().sum::<f64>() / quadrant_means.len().max(1) as f64;
+        let gradient = quadrant_means
+            .iter()
+            .map(|value| (value - mean).abs())
+            .fold(0.0, f64::max);
+        Self {
+            median,
+            noise,
+            gradient,
+        }
+    }
+
+    fn is_similar(self, other: Self) -> bool {
+        if !self.median.is_finite() || !other.median.is_finite() {
+            return false;
+        }
+        let scale = self.noise.max(other.noise).max(1.0);
+        let median_limit = 0.25 * scale + self.median.abs().max(other.median.abs()) * 0.01;
+        (self.median - other.median).abs() <= median_limit
+            && (self.noise - other.noise).abs() <= 0.5 * scale
+            && (self.gradient - other.gradient).abs()
+                <= 0.5 * self.gradient.max(other.gradient).max(scale * 0.01)
+    }
+}
+
+impl Default for BackgroundSignature {
+    fn default() -> Self {
+        Self {
+            median: f64::NAN,
+            noise: f64::NAN,
+            gradient: f64::NAN,
+        }
+    }
 }
 
 impl StarDetector {
@@ -51,8 +130,26 @@ impl StarDetector {
         Self::default()
     }
 
-    /// The optimized path reuses the first frame's background for a given
-    /// crop size and threshold during this detector's lifetime.
+    pub fn prepare_background(
+        &mut self,
+        pixels: &[f64],
+        width: usize,
+        height: usize,
+        config: &DetectionConfig,
+    ) -> Option<(usize, usize, u64, Arc<BackgroundStats>)> {
+        let crop = Crop::new(pixels, width, height, config.center_region_ratio)?;
+        let key = (crop.width, crop.height, config.threshold.to_bits());
+        let stats = Arc::new(compute_background_stats(
+            &crop,
+            config,
+            BackgroundSignature::sample(&crop),
+        ));
+        self.backgrounds.insert(key, Arc::clone(&stats));
+        Some((key.0, key.1, key.2, stats))
+    }
+
+    /// Reuses a prepared baseline until the current frame's sampled background
+    /// changes enough to require a new estimate.
     pub fn detect(
         &mut self,
         pixels: &[f64],
@@ -78,20 +175,16 @@ impl StarDetector {
             return Vec::new();
         };
         let key = (crop.width, crop.height, config.threshold.to_bits());
-        let stats = if let Some(stats) = self.backgrounds.get(&key) {
-            *stats
-        } else {
-            let Some(background) = BackgroundMaps::new(&crop) else {
-                // Both source paths use the same background estimator.
-                return Vec::new();
-            };
-            let stats = BackgroundStats {
-                threshold: background.threshold(config.threshold),
-                level: median(&crop.pixels),
-            };
-            self.backgrounds.insert(key, stats);
-            stats
-        };
+        let signature = BackgroundSignature::sample(&crop);
+        let stats = self
+            .backgrounds
+            .get(&key)
+            .filter(|stats| stats.signature.is_similar(signature))
+            .cloned()
+            .unwrap_or_else(|| Arc::new(compute_background_stats(&crop, config, signature)));
+        if stats.threshold.is_nan() || stats.level.is_nan() {
+            return Vec::new();
+        }
         for value in &mut crop.pixels {
             *value -= stats.level;
         }
@@ -124,6 +217,33 @@ impl StarDetector {
             *value -= level;
         }
         crop.find_stars(threshold, width, height, config.edge_exclusion, &|| false)
+    }
+}
+
+impl Clone for StarDetector {
+    fn clone(&self) -> Self {
+        Self {
+            backgrounds: self.backgrounds.clone(),
+        }
+    }
+}
+
+fn compute_background_stats(
+    crop: &Crop,
+    config: &DetectionConfig,
+    signature: BackgroundSignature,
+) -> BackgroundStats {
+    let Some(background) = BackgroundMaps::new(crop) else {
+        return BackgroundStats {
+            threshold: f64::NAN,
+            level: f64::NAN,
+            signature,
+        };
+    };
+    BackgroundStats {
+        threshold: background.threshold(config.threshold),
+        level: median(&crop.pixels),
+        signature,
     }
 }
 
@@ -785,6 +905,42 @@ mod tests {
         assert_eq!(stars.len(), 1);
         assert!((stars[0].x - 48.35).abs() < 0.2);
         assert!((stars[0].y - 47.65).abs() < 0.2);
+    }
+
+    #[test]
+    fn changed_background_signature_is_not_reused() {
+        let width = 160;
+        let height = 160;
+        let render = |background: f64, gradient: f64, star_x: f64| {
+            (0..height)
+                .flat_map(|y| {
+                    (0..width).map(move |x| {
+                        let dx = (x as f64 - star_x) / 1.35;
+                        let dy = (y as f64 - 80.0) / 1.25;
+                        background
+                            + gradient * x as f64 / width as f64
+                            + ((x * 13 + y * 17) % 7) as f64
+                            + 1800.0 * (-0.5 * (dx.powi(2) + dy.powi(2))).exp()
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let config = DetectionConfig {
+            center_region_ratio: 1.0,
+            edge_exclusion: 5,
+            ..DetectionConfig::default()
+        };
+        let first = render(1_000.0, 0.0, 80.0);
+        let second = render(5_000.0, 3_000.0, 90.0);
+        let mut detector = StarDetector::new();
+        assert_eq!(detector.detect(&first, width, height, &config).len(), 1);
+        assert_eq!(detector.detect(&second, width, height, &config).len(), 1);
+        let frame = Crop::new(&second, width, height, 1.0).unwrap();
+        let signature = BackgroundSignature::sample(&frame);
+        assert!(
+            !BackgroundSignature::sample(&Crop::new(&first, width, height, 1.0).unwrap())
+                .is_similar(signature)
+        );
     }
 
     #[test]

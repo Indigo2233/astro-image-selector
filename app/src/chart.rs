@@ -6,7 +6,7 @@ use egui_plot::{
     HLine, HoverPosition, LineStyle, Plot, PlotBounds, PlotPoint, PlotResponse, Points,
 };
 
-use crate::catalog::{AnalysisResult, Metric};
+use astro_selector::catalog::{AnalysisResult, Metric};
 
 pub struct Chart<'a> {
     pub results: &'a [AnalysisResult],
