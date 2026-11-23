@@ -1,6 +1,6 @@
 [package]
 name = "astro-selector"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 publish = false
 description = "Native Rust desktop application for FITS image quality analysis and selection"

@@ -40,7 +40,7 @@ pub fn launch(project: Option<PathBuf>) -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "AstroImageSelector v1.1.0",
+        "AstroImageSelector v1.1.1",
         options,
         Box::new(move |creation| Ok(Box::new(Desktop::new(creation.egui_ctx.clone(), project)))),
     )
