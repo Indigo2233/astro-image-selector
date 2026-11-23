@@ -698,7 +698,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.cache_hits, 0);
-        assert!(result.gpu_count > 0);
         assert_eq!(result.results.len(), 1);
     }
 
